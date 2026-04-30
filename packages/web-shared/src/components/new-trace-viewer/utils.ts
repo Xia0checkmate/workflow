@@ -30,33 +30,11 @@ export function computeRootBounds(spans: Span[]): RootBounds {
   return { startTime: minStart, endTime: maxEnd, duration };
 }
 
-// ---------------------------------------------------------------------------
-// Time compression
-// ---------------------------------------------------------------------------
-
-export interface TimeCompression {
-  toVisual(time: number): number;
-  fromVisual(fraction: number): number;
-  isCompressed: boolean;
-}
-
-export function buildTimeCompression(
-  _spans: Span[],
-  viewStart: number,
-  viewEnd: number
-): TimeCompression {
-  const range = viewEnd - viewStart;
-
-  return {
-    isCompressed: false,
-    toVisual(time: number): number {
-      if (range <= 0) return 0;
-      return Math.min(Math.max((time - viewStart) / range, 0), 1);
-    },
-    fromVisual(fraction: number): number {
-      return viewStart + fraction * range;
-    },
-  };
+export function getSpanDurationMs(span: Span): number {
+  return Math.max(
+    0,
+    getHighResInMs(span.endTime) - getHighResInMs(span.startTime)
+  );
 }
 
 // ---------------------------------------------------------------------------
@@ -66,6 +44,7 @@ export function buildTimeCompression(
 export interface TimeMarker {
   position: number;
   label: string;
+  value: number;
 }
 
 const NICE_INTERVALS = [
@@ -102,36 +81,7 @@ export function computeTimeMarkers(
     markers.push({
       position: Math.min(Math.max(position, 0), 1),
       label: formatDuration(Math.abs(t), true),
-    });
-    if (markers.length >= MAX_MARKERS) break;
-  }
-
-  return markers;
-}
-
-export function computeCompressedTimeMarkers(
-  compression: TimeCompression,
-  viewStart: number,
-  viewEnd: number,
-  rootStart: number
-): TimeMarker[] {
-  const viewDuration = viewEnd - viewStart;
-  if (viewDuration <= 0) return [];
-
-  const maxTicks = 6;
-  const interval = pickInterval(viewDuration, maxTicks);
-  const offset = viewStart - rootStart;
-
-  const firstTick = Math.ceil(offset / interval) * interval;
-  const markers: TimeMarker[] = [];
-
-  for (let t = firstTick; t <= offset + viewDuration; t += interval) {
-    const absTime = rootStart + t;
-    const position = compression.toVisual(absTime);
-    if (position < -0.01 || position > 1.01) continue;
-    markers.push({
-      position: Math.min(Math.max(position, 0), 1),
-      label: formatDuration(Math.abs(t), true),
+      value: t,
     });
     if (markers.length >= MAX_MARKERS) break;
   }
@@ -152,8 +102,12 @@ export interface SpanGap {
 
 export function computeSpanGaps(
   spans: Span[],
-  compression: TimeCompression
+  viewStart: number,
+  viewEnd: number
 ): SpanGap[] {
+  const range = viewEnd - viewStart;
+  if (range <= 0) return [];
+
   const gaps: SpanGap[] = [];
   for (let i = 0; i < spans.length - 1; i++) {
     const endTime = getHighResInMs(spans[i].endTime);
@@ -161,8 +115,8 @@ export function computeSpanGaps(
     const gapMs = startTime - endTime;
     if (gapMs <= 0) continue;
 
-    const leftFrac = compression.toVisual(endTime);
-    const rightFrac = compression.toVisual(startTime);
+    const leftFrac = Math.min(Math.max((endTime - viewStart) / range, 0), 1);
+    const rightFrac = Math.min(Math.max((startTime - viewStart) / range, 0), 1);
     if (rightFrac - leftFrac < 0.001) continue;
 
     gaps.push({ gapMs, leftFrac, rightFrac, rowIndex: i });
@@ -379,39 +333,12 @@ function computeHookSegmentsFromSpan(
 }
 
 function computeSleepSegmentsFromSpan(
-  startMs: number,
+  _startMs: number,
   duration: number,
-  events: SpanEvent[]
+  _events: SpanEvent[]
 ): Segment[] {
-  const segments: Segment[] = [];
-  if (duration <= 0) return segments;
-
-  const completedTime = events
-    .filter((e) => e.name === 'wait_completed')
-    .map((e) => getHighResInMs(e.timestamp))
-    .sort((a, b) => a - b)[0];
-
-  if (completedTime === undefined) {
-    segments.push({ startFraction: 0, endFraction: 1, status: 'sleeping' });
-    return segments;
-  }
-
-  const completedFrac = timeToFraction(completedTime, startMs, duration);
-  if (completedFrac > 0.001) {
-    segments.push({
-      startFraction: 0,
-      endFraction: completedFrac,
-      status: 'sleeping',
-    });
-  }
-
-  segments.push({
-    startFraction: completedFrac,
-    endFraction: 1,
-    status: 'succeeded',
-  });
-
-  return segments;
+  if (duration <= 0) return [];
+  return [{ startFraction: 0, endFraction: 1, status: 'sleeping' }];
 }
 
 function computeRunSegmentsFromSpan(
@@ -497,8 +424,7 @@ function computeV1RunSegments(
  */
 export function computeSpanSegments(span: Span): Segment[] {
   const startMs = getHighResInMs(span.startTime);
-  const endMs = getHighResInMs(span.endTime);
-  const duration = endMs - startMs;
+  const duration = getSpanDurationMs(span);
   const activeStartMs = span.activeStartTime
     ? getHighResInMs(span.activeStartTime)
     : undefined;

@@ -11,8 +11,7 @@ import {
 } from 'react';
 import { cn } from '../../../lib/utils';
 
-/** Wide enough for comfortable dragging; visual line stays 1px centered. */
-const GUTTER_PX = 9;
+const GUTTER_PX = 1;
 const MIN_PX = 50;
 const DEFAULT_START_PX = 340;
 
@@ -155,7 +154,7 @@ export function SplitPane({
         <div
           ref={containerRef}
           className={cn(
-            'grid flex-1 min-h-0 content-start overflow-x-hidden overflow-y-auto',
+            'grid flex-1 min-h-0 overflow-x-hidden overflow-y-auto',
             isDragging && 'select-none'
           )}
           style={{ gridTemplateColumns: colTemplate }}
