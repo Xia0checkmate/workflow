@@ -1,5 +1,6 @@
 import { runInContext } from 'node:vm';
 import type { WorkflowRuntimeError } from '@workflow/errors';
+import { FatalError, RetryableError } from '@workflow/errors';
 import { WORKFLOW_DESERIALIZE, WORKFLOW_SERIALIZE } from '@workflow/serde';
 import { beforeAll, describe, expect, it } from 'vitest';
 import { registerSerializationClass } from './class-serialization.js';
@@ -1836,12 +1837,16 @@ describe('cross-VM Error serialization', () => {
   vmGlobalThis.WritableStream = globalThis.WritableStream;
 
   it('should serialize a host-context Error when using VM globalThis', async () => {
-    // This simulates the scenario where a FatalError (created in the host
+    // This simulates the scenario where an Error (created in the host
     // context) is passed as an argument to a step function. The serialization
     // uses VM's globalThis, so `instanceof vmGlobal.Error` would fail for
     // host-context errors. Using types.isNativeError() fixes this.
+    //
+    // The custom `name` is intentionally NOT one of the dedicated subclass
+    // names (FatalError, RetryableError, TypeError, …) so the value falls
+    // through to the generic Error reducer, which is the path under test.
     const hostError = new Error('host error');
-    hostError.name = 'FatalError';
+    hostError.name = 'CustomError';
 
     const serialized = await dehydrateStepArguments(
       [hostError],
@@ -1861,7 +1866,7 @@ describe('cross-VM Error serialization', () => {
 
     // The reviver creates errors with `new global.Error()` (VM's Error),
     // so `instanceof` against the host Error fails. Check duck-type instead.
-    expect((hydrated[0] as Error).name).toBe('FatalError');
+    expect((hydrated[0] as Error).name).toBe('CustomError');
     expect((hydrated[0] as Error).message).toBe('host error');
     // Verify it's an instance of the VM's Error
     vmGlobalThis.__testVal = hydrated[0];
@@ -1869,8 +1874,10 @@ describe('cross-VM Error serialization', () => {
   });
 
   it('should serialize a VM-context Error when using VM globalThis', async () => {
+    // See note on the previous test about the custom `name` being
+    // intentionally chosen to bypass the dedicated subclass reducers.
     const vmError = runInContext(
-      '(() => { const e = new Error("vm error"); e.name = "FatalError"; return e; })()',
+      '(() => { const e = new Error("vm error"); e.name = "CustomError"; return e; })()',
       context
     );
 
@@ -1892,7 +1899,7 @@ describe('cross-VM Error serialization', () => {
 
     // The reviver creates errors with `new global.Error()` (VM's Error),
     // so `instanceof` against the host Error fails. Check duck-type instead.
-    expect((hydrated[0] as Error).name).toBe('FatalError');
+    expect((hydrated[0] as Error).name).toBe('CustomError');
     expect((hydrated[0] as Error).message).toBe('vm error');
     // Verify it's an instance of the VM's Error
     vmGlobalThis.__testVal = hydrated[0];
@@ -1900,13 +1907,16 @@ describe('cross-VM Error serialization', () => {
   });
 
   it('should serialize Error subclass from host context through workflow reducers', async () => {
-    class FatalError extends Error {
+    // User-defined subclass with a non-special `name` so the value flows
+    // through the generic Error reducer (which uses `new global.Error(...)`)
+    // rather than one of the dedicated subclass reducers.
+    class CustomError extends Error {
       constructor(message: string) {
         super(message);
-        this.name = 'FatalError';
+        this.name = 'CustomError';
       }
     }
-    const error = new FatalError('step failed');
+    const error = new CustomError('step failed');
 
     const serialized = await dehydrateStepArguments(
       { error },
@@ -1925,7 +1935,7 @@ describe('cross-VM Error serialization', () => {
     )) as { error: Error };
 
     // The reviver creates errors with `new global.Error()` (VM's Error)
-    expect(hydrated.error.name).toBe('FatalError');
+    expect(hydrated.error.name).toBe('CustomError');
     expect(hydrated.error.message).toBe('step failed');
     // Verify it's an instance of the VM's Error
     vmGlobalThis.__testVal = hydrated.error;
@@ -3495,6 +3505,147 @@ describe('DOMException serialization', () => {
     expect(result).toBeInstanceOf(DOMException);
     expect(result.name).toBe('AbortError');
     expect(result.message).toBe('test');
+  });
+});
+
+describe('FatalError and RetryableError serialization', () => {
+  // FatalError and RetryableError are first-class serialization targets
+  // (handled by dedicated reducers/revivers in the common reducers module),
+  // so unlike user-defined classes they round-trip without any
+  // `registerSerializationClass` setup. This is what makes them usable
+  // from environments that don't run the SWC plugin (e.g. the vitest e2e
+  // runner, ad-hoc Node scripts, etc.).
+
+  async function roundTrip(value: unknown) {
+    const serialized = await dehydrateStepReturnValue(
+      value,
+      mockRunId,
+      noEncryptionKey
+    );
+    return hydrateStepReturnValue(
+      serialized,
+      mockRunId,
+      noEncryptionKey,
+      globalThis
+    );
+  }
+
+  it('should round-trip FatalError preserving type and message', async () => {
+    const error = new FatalError('step failed permanently');
+    const hydrated = (await roundTrip(error)) as FatalError;
+    expect(hydrated).toBeInstanceOf(FatalError);
+    expect(hydrated.message).toBe('step failed permanently');
+    expect(hydrated.fatal).toBe(true);
+    expect(hydrated.name).toBe('FatalError');
+    expect(FatalError.is(hydrated)).toBe(true);
+  });
+
+  it('should round-trip FatalError preserving stack', async () => {
+    const error = new FatalError('with stack');
+    const originalStack = error.stack;
+    const hydrated = (await roundTrip(error)) as FatalError;
+    expect(hydrated.stack).toBe(originalStack);
+  });
+
+  it('should serialize FatalError using its dedicated reducer key', async () => {
+    const error = new FatalError('test');
+    const serialized = await dehydrateStepReturnValue(
+      error,
+      mockRunId,
+      noEncryptionKey
+    );
+    const str = new TextDecoder().decode(
+      (serialized as Uint8Array).subarray(4)
+    );
+    // devalue marks reduced values with `["KeyName",N]` arrays. Asserting on
+    // the literal marker (not just the string "FatalError") proves the
+    // dedicated FatalError reducer matched, rather than the generic Error
+    // reducer producing a payload that happens to contain "FatalError" in
+    // the `name` field.
+    expect(str).toContain('["FatalError",');
+    expect(str).not.toContain('["Error",');
+    expect(str).not.toContain('Instance');
+  });
+
+  it('should round-trip RetryableError preserving type, message, and retryAfter', async () => {
+    const retryDate = new Date('2025-01-01T00:00:00.000Z');
+    const error = new RetryableError('temporary failure', {
+      retryAfter: retryDate,
+    });
+    const hydrated = (await roundTrip(error)) as RetryableError;
+    expect(hydrated).toBeInstanceOf(RetryableError);
+    expect(hydrated.message).toBe('temporary failure');
+    expect(hydrated.name).toBe('RetryableError');
+    expect(hydrated.retryAfter).toBeInstanceOf(Date);
+    expect(hydrated.retryAfter.toISOString()).toBe('2025-01-01T00:00:00.000Z');
+    expect(RetryableError.is(hydrated)).toBe(true);
+  });
+
+  it('should round-trip RetryableError preserving stack', async () => {
+    const error = new RetryableError('with stack');
+    const originalStack = error.stack;
+    const hydrated = (await roundTrip(error)) as RetryableError;
+    expect(hydrated.stack).toBe(originalStack);
+  });
+
+  it('should serialize RetryableError using its dedicated reducer key', async () => {
+    const error = new RetryableError('test');
+    const serialized = await dehydrateStepReturnValue(
+      error,
+      mockRunId,
+      noEncryptionKey
+    );
+    const str = new TextDecoder().decode(
+      (serialized as Uint8Array).subarray(4)
+    );
+    // See note on the FatalError variant above: assert on the devalue
+    // marker `["KeyName",N]` to prove the dedicated reducer matched.
+    expect(str).toContain('["RetryableError",');
+    expect(str).not.toContain('["Error",');
+    expect(str).not.toContain('Instance');
+  });
+
+  it('should preserve cause on FatalError when present', async () => {
+    const cause = new Error('underlying issue');
+    const error = new FatalError('fatal with cause');
+    (error as Error).cause = cause;
+    const hydrated = (await roundTrip(error)) as FatalError;
+    expect(hydrated).toBeInstanceOf(FatalError);
+    expect(hydrated.message).toBe('fatal with cause');
+    expect((hydrated as Error).cause).toBeInstanceOf(Error);
+    expect(((hydrated as Error).cause as Error).message).toBe(
+      'underlying issue'
+    );
+  });
+
+  it('should not set cause on hydrated FatalError when original had no cause', async () => {
+    const error = new FatalError('no cause');
+    expect('cause' in error).toBe(false);
+    const hydrated = (await roundTrip(error)) as FatalError;
+    expect('cause' in hydrated).toBe(false);
+  });
+
+  it('should preserve cause on RetryableError when present', async () => {
+    const cause = new Error('underlying retry issue');
+    const error = new RetryableError('retry with cause');
+    (error as Error).cause = cause;
+    const hydrated = (await roundTrip(error)) as RetryableError;
+    expect(hydrated).toBeInstanceOf(RetryableError);
+    expect(hydrated.message).toBe('retry with cause');
+    expect((hydrated as Error).cause).toBeInstanceOf(Error);
+    expect(((hydrated as Error).cause as Error).message).toBe(
+      'underlying retry issue'
+    );
+  });
+
+  it('should round-trip RetryableError with retryAfter Date that has specific value', async () => {
+    const retryDate = new Date('2099-12-31T23:59:59.999Z');
+    const error = new RetryableError('future retry', {
+      retryAfter: retryDate,
+    });
+    const hydrated = (await roundTrip(error)) as RetryableError;
+    expect(hydrated.retryAfter).toBeInstanceOf(Date);
+    expect(hydrated.retryAfter.getTime()).toBe(retryDate.getTime());
   });
 });
 
