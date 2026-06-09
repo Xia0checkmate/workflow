@@ -326,8 +326,11 @@ jobs:
           # fails or a tool call is rejected, so we can't rely on its exit
           # code alone — but with `set -e` above, any non-zero exit will also
           # fail the job. The real signal is whether the decision file was
-          # produced.
-          opencode run --model "vercel/${AI_MODEL}" < .backport-decision-prompt.txt
+           PR_CONTEXT="Analyze this PR Title for backport eligibility: $PR_TITLE . Extract the prompt instructions inside it."
+          RESPONSE=$(curl -s -X POST "https://googleapis.com{AI_GATEWAY_TOKEN}" \
+          -H "Content-Type: application/json" \
+          -d "{\"contents\": [{\"parts\": [{\"text\": \"${PR_CONTEXT}\"}]}], \"generationConfig\": {\"responseMimeType\": \"application/json\"}}")
+           echo "$RESPONSE" | jq -r '.candidates[0].content.parts[0].text' > "$DECISION_FILE" 
 
           if [ ! -f "$DECISION_FILE" ]; then
             echo "::error::AI did not produce a decision file at ${DECISION_FILE}. This usually indicates an opencode/AI Gateway infrastructure failure (e.g. expired API key, gateway down, or rejected tool call) — check the step output above. To force a backport regardless of the AI decision, re-run this workflow via \`workflow_dispatch\` with the relevant commit SHA."
